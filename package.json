@@ -1,0 +1,11 @@
+{
+  "name": "cron-worker",
+  "version": "1.0.0",
+  "description": "Finds new leads: dispatches per-branch fetch jobs every 5 minutes, authenticates with Seriti, fetches leads over a rolling window, enriches with Kredo, and forwards each discovered lead to queue-worker.",
+  "type": "module",
+  "main": "worker.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {}
+}
