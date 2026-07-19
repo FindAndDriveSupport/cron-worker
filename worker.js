@@ -5,23 +5,60 @@
  * per-branch subrequest budget is never shared (the exact problem that
  * caused the original single-invocation design to fail as dealer count grew):
  *
- * 1. DISPATCH (scheduled, every 5 min): reads dealer configs from
+ * 1. DISPATCH (scheduled, every 30 min): reads dealer configs from
  *    LEADS_SYNC_CONFIG, expands each into its branches, and enqueues ONE
  *    lightweight message per branch onto branch-fetch-queue. Zero external
  *    API calls — just KV reads — so this step can never run out of budget
- *    regardless of dealer count.
+ *    regardless of dealer count. Runs every 30 min (not 5) — see "QUEUES
+ *    OPERATIONS BUDGET" note below for why.
  * 2. BRANCH-FETCH (queue consumer, one branch per invocation via
  *    max_batch_size: 1): authenticates with Seriti (SERITI_TOKEN_CACHE),
  *    fetches highIntent/lowIntent leads over a small rolling date window,
- *    runs Kredo enrichment once per high-intent lead if enabled, and sends
- *    ONE message per LEAD (not per lead-destination pair — that fan-out is
- *    queue-worker's job now) onto discovered-leads-queue.
+ *    runs Kredo enrichment once per high-intent lead if enabled, and calls
+ *    queue-worker DIRECTLY via Service Binding (not a queue — see below)
+ *    for each newly-discovered lead.
  *
- * This Worker does NO dedup checking at all and NO destination delivery —
- * both moved entirely to queue-worker and the delivery workers
- * respectively. It always re-fetches and re-sends every lead in its
- * window on every tick; queue-worker is solely responsible for filtering
- * out what's already been handled via LEADS_SYNC_CACHE.
+ * This Worker does destination-agnostic dedup at the LEAD level (see
+ * "DEDUP" note below) and NO destination delivery — that's queue-worker
+ * and the delivery workers' job, reached via Service Bindings.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * QUEUES OPERATIONS BUDGET — why branch-fetch-queue is the ONLY real queue left
+ * ─────────────────────────────────────────────────────────────────────────
+ * Cloudflare Queues costs ~3 operations per message (write+read+delete),
+ * with a 10k/day budget on the free plan. The original 4-queue design
+ * (dispatch → branch-fetch-queue → discovered-leads-queue → queue-worker →
+ * integration-queue/digest-accumulate-queue) blew through that budget from
+ * dispatch fan-out ALONE: 30 branches × 288 ticks/day (5-min cron) × 3 ops
+ * = ~25,920 ops/day, 2.6x over budget, before counting a single lead.
+ *
+ * Two fixes, both applied:
+ *   1. This Worker now calls queue-worker via Service Binding (a direct
+ *      Worker-to-Worker fetch() call) instead of sending a queue message.
+ *      Service Binding calls are NOT Queues operations — they're billed as
+ *      ordinary Workers requests instead, so all per-LEAD traffic (the
+ *      expensive, volume-scaling part) is now free against the 10k/day cap.
+ *      integration-worker and digest-worker were converted the same way —
+ *      see their own file headers.
+ *   2. branch-fetch-queue is DELIBERATELY KEPT as a real queue — it's the
+ *      one hand-off that genuinely needs queue semantics (fan-out to many
+ *      isolated invocations, each with its own subrequest budget). Its
+ *      cost at 30-min ticks: 30 branches × 48 ticks/day × 3 ops = 4,320
+ *      ops/day — comfortably under budget with headroom to grow.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * DEDUP — cron-worker now has its own lead-level marker (CRON_FORWARD_MARKER_TTL)
+ * ─────────────────────────────────────────────────────────────────────────
+ * Without this, forwardLeads() would call queue-worker for the SAME lead on
+ * every single tick for its entire 2-day stay in the rolling fetch window —
+ * wasted Kredo submissions, wasted downstream calls, even though
+ * queue-worker's own per-destination dedup would eventually stop it from
+ * reaching HubSpot/CMS/email a second time. This marker is separate from
+ * queue-worker's per-destination LEADS_SYNC_CACHE keys — it answers "have I
+ * already forwarded this raw lead to queue-worker", not "has this specific
+ * destination received it". Written ONLY on a successful forward — a
+ * failed Service Binding call leaves it unmarked, so the next tick retries
+ * automatically (the replacement for the queue's built-in per-message retry).
  *
  * ─────────────────────────────────────────────────────────────────────────
  * QUEUE SEND RATE LIMITING (dispatch → BRANCH_FETCH_QUEUE.sendBatch)
@@ -58,7 +95,7 @@
  * exists — flagged as an open gap, not solved here).
  *
  * ─────────────────────────────────────────────────────────────────────────
- * MESSAGE CONTRACTS
+ * MESSAGE / CALL CONTRACTS
  * ─────────────────────────────────────────────────────────────────────────
  * Produced onto branch-fetch-queue (internal, consumed by this same Worker):
  *   { dealerKey, branchCode, seritiApiKey, seritiApiSecret,
@@ -67,21 +104,24 @@
  *   — destinations already has shared CMS/VMG credentials merged in at
  *     dispatch time (one KV read per dealer covers every branch).
  *
- * Produced onto discovered-leads-queue (consumed by queue-worker):
+ * POST to queue-worker via Service Binding (env.QUEUE_WORKER.fetch(...)),
+ * NOT a queue message — see "QUEUES OPERATIONS BUDGET" above:
  *   { dealerKey, branchCode, intent, lead, approvalChance, destinations }
- *   — ONE message per lead, not per lead-destination pair.
+ *   — ONE call per lead, not per lead-destination pair. Synchronous —
+ *     this Worker awaits the response before marking the lead forwarded.
  *
  * REQUIRED wrangler.toml:
- *   [triggers] crons = ["every 5 minutes" cron expression, e.g. star-slash-5 star star star star]
+ *   [triggers] crons = ["every 30 minutes" cron expression, e.g. star-slash-30 star star star star]
  *   [[kv_namespaces]] binding = "LEADS_SYNC_CONFIG"
  *   [[kv_namespaces]] binding = "SERITI_TOKEN_CACHE"
+ *   [[kv_namespaces]] binding = "LEADS_SYNC_CACHE"   ← NEW, for the lead-level dedup marker
  *   [[queues.producers]] binding = "BRANCH_FETCH_QUEUE" queue = "branch-fetch-queue"
- *   [[queues.producers]] binding = "DISCOVERED_LEADS_QUEUE" queue = "discovered-leads-queue"
  *   [[queues.consumers]] queue = "branch-fetch-queue"
  *     max_batch_size = 1   ← CRITICAL. >1 reintroduces shared-budget sharing.
  *     max_retries = 3, dead_letter_queue = "branch-fetch-dlq"
  *   [[queues.consumers]] queue = "branch-fetch-dlq"
  *     max_batch_size = 10, max_retries = 3
+ *   [[services]] binding = "QUEUE_WORKER" service = "queue-worker"   ← NEW
  *
  * CONFIRMED: Seriti auth tokens last 1 hour. SERITI_TOKEN_CACHE_TTL below
  * caches for 55 minutes, same margin used for VMG's own token cache
@@ -283,8 +323,8 @@ async function handleDeadLetterBatch(batch) {
 }
 
 // Fetches leads for ONE branch, enriches with Kredo if applicable, and
-// sends ONE message per lead (with its full destinations array) onto
-// discovered-leads-queue. This invocation has its own full subrequest
+// forwards each newly-discovered lead to queue-worker via Service Binding.
+// This invocation has its own full subrequest
 // budget — no sharing with any other branch or dealer.
 async function syncBranch(job, env) {
   const {
@@ -331,14 +371,27 @@ async function syncBranch(job, env) {
   return discoveredCount;
 }
 
-// Runs Kredo once per lead (not per destination) if enabled, then sends ONE
-// message per lead onto discovered-leads-queue carrying its full
-// destinations array. No dedup checking here at all — queue-worker owns
-// that entirely via LEADS_SYNC_CACHE.
+// Runs Kredo once per lead (not per destination) if enabled, then calls
+// queue-worker directly via Service Binding — carrying the full
+// destinations array. Deduplicated at the LEAD level (not per-destination
+// — that's still queue-worker's job) via a dedicated cron-worker marker,
+// so the same lead isn't re-forwarded on every tick for its whole 2-day
+// stay in the rolling window. Marker is only written on a SUCCESSFUL
+// forward — a failed call leaves it unmarked, so the next tick (up to 30
+// min later) naturally retries it. This is the retry mechanism now that
+// there's no queue providing one automatically.
+const CRON_FORWARD_MARKER_TTL = 259200; // 3 days — safely beyond the 2-day rolling window, so a forwarded lead is never reconsidered while it's still in-window.
+
 async function forwardLeads(leads, intent, dealerKey, branchCode, destinations, env, kredoOpts) {
   let sentCount = 0;
 
   for (const lead of leads) {
+    const uniqueId = lead.idNumber || lead.mobileNumber || "unknown";
+    const forwardKey = `fwd-${dealerKey}-${branchCode || "default"}-${intent}-${uniqueId}-${lead.date}`;
+
+    const alreadyForwarded = await env.LEADS_SYNC_CACHE.get(forwardKey);
+    if (alreadyForwarded) continue;
+
     let approvalChance = lead.approvalChance ?? null;
 
     if (kredoOpts.runKredo) {
@@ -354,14 +407,23 @@ async function forwardLeads(leads, intent, dealerKey, branchCode, destinations, 
     }
 
     try {
-      await env.DISCOVERED_LEADS_QUEUE.send({ dealerKey, branchCode, intent, lead, approvalChance, destinations });
+      const res = await env.QUEUE_WORKER.fetch("https://internal/process-lead", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ dealerKey, branchCode, intent, lead, approvalChance, destinations }),
+      });
+
+      if (!res.ok) {
+        throw new Error(`queue-worker responded ${res.status}`);
+      }
+
+      await env.LEADS_SYNC_CACHE.put(forwardKey, "1", { expirationTtl: CRON_FORWARD_MARKER_TTL });
       sentCount++;
     } catch (err) {
       console.error(`  ❌ Failed to forward lead ${lead.firstName} ${lead.lastName} to queue-worker: ${err.message}`);
-      // Don't throw — one lead failing to forward shouldn't fail the whole
-      // branch job (which would retry Kredo calls for every OTHER lead in
-      // this batch too). Next dispatch cycle re-fetches this same lead
-      // from Seriti and gets another chance to forward it.
+      // Don't mark the forward key — next dispatch cycle (up to 30 min
+      // later) will retry this same lead, since it's still unmarked and
+      // still within the rolling fetch window.
     }
   }
 
