@@ -240,16 +240,26 @@ async function dispatch(env) {
     }
   }
 
-  // Chunk into batches of 100 (Queues sendBatch's own max). Each chunk is
-  // independently fault-tolerant — see file header "QUEUE SEND RATE
-  // LIMITING" note for why this matters.
+  // Chunk into smaller batches than Queues' own 100-message max — sending
+  // everything in one large sendBatch() call risks hitting a per-request
+  // burst/throughput limit even when the DAILY operations budget is fine
+  // (confirmed in production: a single 30-message sendBatch() call got
+  // "Too Many Requests" even after moving dispatch to a 30-min interval,
+  // which had already fixed the separate daily-budget problem). A smaller
+  // chunk size, with a brief pause between chunks, spreads the same total
+  // message count across multiple smaller bursts instead of one large one.
+  // Each chunk is still independently fault-tolerant — see file header
+  // "QUEUE SEND RATE LIMITING" note.
+  const CHUNK_SIZE = 10;
+  const CHUNK_DELAY_MS = 300;
+
   let successfullyEnqueued = 0;
   let chunksFailed = 0;
-  const totalChunks = Math.ceil(messages.length / 100) || 0;
+  const totalChunks = Math.ceil(messages.length / CHUNK_SIZE) || 0;
 
-  for (let i = 0; i < messages.length; i += 100) {
-    const chunk = messages.slice(i, i + 100);
-    const chunkNum = Math.floor(i / 100) + 1;
+  for (let i = 0; i < messages.length; i += CHUNK_SIZE) {
+    const chunk = messages.slice(i, i + CHUNK_SIZE);
+    const chunkNum = Math.floor(i / CHUNK_SIZE) + 1;
     try {
       await sendBatchWithRetry(env, chunk);
       successfullyEnqueued += chunk.length;
@@ -257,8 +267,15 @@ async function dispatch(env) {
       chunksFailed++;
       console.error(
         `❌ Chunk ${chunkNum}/${totalChunks} (${chunk.length} branch job(s)) failed to enqueue after all retries: ${err.message}. ` +
-        `These branches were NOT dispatched this cycle — they'll be attempted again automatically on the next dispatch (~5 min).`
+        `These branches were NOT dispatched this cycle — they'll be attempted again automatically on the next dispatch (~30 min).`
       );
+    }
+
+    // Brief pause between chunks — gives any per-second/per-request burst
+    // ceiling room to reset before the next sendBatch() call, rather than
+    // firing every chunk back-to-back as fast as the loop can go.
+    if (i + CHUNK_SIZE < messages.length) {
+      await new Promise((resolve) => setTimeout(resolve, CHUNK_DELAY_MS));
     }
   }
 
