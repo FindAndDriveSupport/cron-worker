@@ -1,0 +1,54 @@
+name = "cron-worker"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+# NOTE: tail_consumers → alert-worker intentionally omitted for now — see
+# integration-worker's wrangler.toml for why (code 100150, Workers Paid
+# plan required for Tail Workers). Add once billing status is resolved:
+# tail_consumers = [{ service = "alert-worker" }]
+# This is the Worker most worth re-adding it to first — it's the one
+# that's actually failed in production before.
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[[kv_namespaces]]
+binding = "LEADS_SYNC_CONFIG"
+id = "352dc4a8e9244b88b315a12590fd6a1a"
+
+[[kv_namespaces]]
+binding = "SERITI_TOKEN_CACHE"
+id = "47ee9f348de54ce99409be1b613a9cc6"
+
+# Internal fan-out queue — dispatch() pushes one lightweight message per
+# branch here; branch-fetch does the actual Seriti/Kredo work.
+[[queues.producers]]
+binding = "BRANCH_FETCH_QUEUE"
+queue = "branch-fetch-queue"
+
+# Hands off discovered leads to queue-worker for dedup + routing.
+[[queues.producers]]
+binding = "DISCOVERED_LEADS_QUEUE"
+queue = "discovered-leads-queue"
+
+# Branch-fetch consumer. max_batch_size = 1 is CRITICAL — this guarantees
+# every branch gets its own full subrequest budget, with zero sharing
+# across branches. Raising this reintroduces the exact problem the whole
+# multi-worker redesign exists to eliminate.
+[[queues.consumers]]
+queue = "branch-fetch-queue"
+max_batch_size = 1
+max_batch_timeout = 5
+max_retries = 3
+dead_letter_queue = "branch-fetch-dlq"
+
+# Dead-letter consumer — backstop alerting for anything that lands here.
+[[queues.consumers]]
+queue = "branch-fetch-dlq"
+max_batch_size = 10
+max_retries = 3
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+head_sampling_rate = 0.2
