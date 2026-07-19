@@ -2,15 +2,10 @@ name = "cron-worker"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 compatibility_flags = ["nodejs_compat"]
-# NOTE: tail_consumers → alert-worker intentionally omitted for now — see
-# integration-worker's wrangler.toml for why (code 100150, Workers Paid
-# plan required for Tail Workers). Add once billing status is resolved:
-# tail_consumers = [{ service = "alert-worker" }]
-# This is the Worker most worth re-adding it to first — it's the one
-# that's actually failed in production before.
+tail_consumers = [{ service = "alert-worker" }]
 
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["*/30 * * * *"]
 
 [[kv_namespaces]]
 binding = "LEADS_SYNC_CONFIG"
@@ -20,16 +15,25 @@ id = "352dc4a8e9244b88b315a12590fd6a1a"
 binding = "SERITI_TOKEN_CACHE"
 id = "47ee9f348de54ce99409be1b613a9cc6"
 
+# NEW — the lead-level dedup marker (see file header "DEDUP" note) lives
+# here, same namespace every other worker in this pipeline shares.
+[[kv_namespaces]]
+binding = "LEADS_SYNC_CACHE"
+id = "5bdb23b812e54e0fbd9b70dfa25cd5db"
+
 # Internal fan-out queue — dispatch() pushes one lightweight message per
-# branch here; branch-fetch does the actual Seriti/Kredo work.
+# branch here; branch-fetch does the actual Seriti/Kredo work. Kept as a
+# real queue deliberately — see file header "QUEUES OPERATIONS BUDGET" note.
 [[queues.producers]]
 binding = "BRANCH_FETCH_QUEUE"
 queue = "branch-fetch-queue"
 
-# Hands off discovered leads to queue-worker for dedup + routing.
-[[queues.producers]]
-binding = "DISCOVERED_LEADS_QUEUE"
-queue = "discovered-leads-queue"
+# NEW — replaces the old DISCOVERED_LEADS_QUEUE producer. Per-lead traffic
+# now goes through here instead of a queue, since Service Binding calls
+# aren't billed as Queues operations. See file header for the full reasoning.
+[[services]]
+binding = "QUEUE_WORKER"
+service = "queue-worker"
 
 # Branch-fetch consumer. max_batch_size = 1 is CRITICAL — this guarantees
 # every branch gets its own full subrequest budget, with zero sharing
@@ -52,3 +56,4 @@ max_retries = 3
 enabled = true
 invocation_logs = true
 head_sampling_rate = 0.2
+
