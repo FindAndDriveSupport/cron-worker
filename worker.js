@@ -362,6 +362,7 @@ async function syncBranch(job, env) {
 
   if (highResult.status === "fulfilled") {
     console.log(`── High Intent: ${label} (${highResult.value.length} leads) ──`);
+    highResult.value.forEach(l => console.log(`  🔍 lead dealerCode="${l.dealerCode}" dealerName="${l.dealerName}" (requested seritiDealershipId=${seritiDealershipId})`));
     discoveredCount += await forwardLeads(highResult.value, "highIntent", dealerKey, branchCode, destinations, env, {
       runKredo: kredoEnabled, kredoUsername, kredoPassword, kredoXApiKey,
     });
