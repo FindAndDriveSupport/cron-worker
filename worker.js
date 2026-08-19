@@ -5,12 +5,13 @@
  * per-branch subrequest budget is never shared (the exact problem that
  * caused the original single-invocation design to fail as dealer count grew):
  *
- * 1. DISPATCH (scheduled, every 30 min): reads dealer configs from
+ * 1. DISPATCH (scheduled, every 5 min): reads dealer configs from
  *    LEADS_SYNC_CONFIG, expands each into its branches, and enqueues ONE
  *    lightweight message per branch onto branch-fetch-queue. Zero external
  *    API calls — just KV reads — so this step can never run out of budget
- *    regardless of dealer count. Runs every 30 min (not 5) — see "QUEUES
- *    OPERATIONS BUDGET" note below for why.
+ *    regardless of dealer count. Runs every 5 min — see "QUEUES
+ *    OPERATIONS BUDGET" note below for the current cost model on the
+ *    upgraded Queues plan.
  * 2. BRANCH-FETCH (queue consumer, one branch per invocation via
  *    max_batch_size: 1): authenticates with Seriti (SERITI_TOKEN_CACHE),
  *    fetches highIntent/lowIntent leads over a small rolling date window,
@@ -25,26 +26,34 @@
  * ─────────────────────────────────────────────────────────────────────────
  * QUEUES OPERATIONS BUDGET — why branch-fetch-queue is the ONLY real queue left
  * ─────────────────────────────────────────────────────────────────────────
- * Cloudflare Queues costs ~3 operations per message (write+read+delete),
- * with a 10k/day budget on the free plan. The original 4-queue design
+ * Cloudflare Queues costs ~3 operations per message (write+read+delete).
+ * On the original free plan (10k ops/day cap), the original 4-queue design
  * (dispatch → branch-fetch-queue → discovered-leads-queue → queue-worker →
  * integration-queue/digest-accumulate-queue) blew through that budget from
- * dispatch fan-out ALONE: 30 branches × 288 ticks/day (5-min cron) × 3 ops
- * = ~25,920 ops/day, 2.6x over budget, before counting a single lead.
+ * dispatch fan-out ALONE at 5-min ticks, which is why dispatch was
+ * temporarily slowed to 30 min. The account has since been upgraded to a
+ * paid Queues plan (1M ops/month included, then $0.40/million overage),
+ * which removes the hard daily cap and allows 5-min dispatch again.
  *
- * Two fixes, both applied:
- *   1. This Worker now calls queue-worker via Service Binding (a direct
+ * Two fixes remain in place regardless of plan:
+ *   1. This Worker calls queue-worker via Service Binding (a direct
  *      Worker-to-Worker fetch() call) instead of sending a queue message.
  *      Service Binding calls are NOT Queues operations — they're billed as
  *      ordinary Workers requests instead, so all per-LEAD traffic (the
- *      expensive, volume-scaling part) is now free against the 10k/day cap.
- *      integration-worker and digest-worker were converted the same way —
- *      see their own file headers.
+ *      expensive, volume-scaling part) never touches the Queues budget at
+ *      all, on any plan. integration-worker and digest-worker were
+ *      converted the same way — see their own file headers.
  *   2. branch-fetch-queue is DELIBERATELY KEPT as a real queue — it's the
  *      one hand-off that genuinely needs queue semantics (fan-out to many
- *      isolated invocations, each with its own subrequest budget). Its
- *      cost at 30-min ticks: 30 branches × 48 ticks/day × 3 ops = 4,320
- *      ops/day — comfortably under budget with headroom to grow.
+ *      isolated invocations, each with its own subrequest budget).
+ *
+ * Current cost at 5-min ticks (37 dealers/branches as of June 2026):
+ *   37 branches × 288 ticks/day × 3 ops = 31,968 ops/day (~959k/month) —
+ *   currently within the 1M/month included on Workers Paid, but will cross
+ *   into the $0.40/million overage tier as more dealers are onboarded.
+ *   Re-check the Billable Usage dashboard (Workers & Pages → Queues →
+ *   Metrics) after onboarding new dealers, and after this change has run
+ *   for a few days, to confirm actual usage matches this estimate.
  *
  * ─────────────────────────────────────────────────────────────────────────
  * DEDUP — cron-worker now has its own lead-level marker (CRON_FORWARD_MARKER_TTL)
@@ -65,8 +74,14 @@
  * ─────────────────────────────────────────────────────────────────────────
  * This exact failure took leads-api down for most of a day: sendBatch()
  * throwing "Too Many Requests" on every single 5-minute tick, uncaught,
- * killing the entire dispatch run before later chunks ever sent. Fixed two
- * ways, both preserved here:
+ * killing the entire dispatch run before later chunks ever sent. That
+ * failure was a per-request/burst throughput ceiling, SEPARATE from the
+ * daily/monthly operations budget — it resurfaced even after dispatch had
+ * already been slowed to 30 min, which had only fixed the budget problem,
+ * not the burst problem. Now that dispatch is back on 5-min ticks (this
+ * ceiling gets hit up to 6x more often than at 30-min ticks), watch logs
+ * closely for "chunksFailed" warnings after deploying this change. Fixed
+ * two ways, both preserved here:
  *   1. Each chunk's send is independently fault-tolerant — dispatch()'s
  *      loop catches per-chunk failures and moves on to the next chunk
  *      rather than throwing and aborting everything after it.
@@ -78,7 +93,8 @@
  * backoff, that's a sign of a genuine sustained rate ceiling for this
  * account/plan — check the actual current limit in the Cloudflare
  * dashboard (Queues → branch-fetch-queue → Settings) rather than assuming
- * any specific number.
+ * any specific number. If it resurfaces at 5-min ticks, consider raising
+ * CHUNK_DELAY_MS or lowering CHUNK_SIZE before reverting to 30 min.
  *
  * ─────────────────────────────────────────────────────────────────────────
  * ROLLING DATE WINDOW (fetchSeritiLeads)
@@ -89,10 +105,13 @@
  * every day even though downstream dedup discards almost everything in it.
  * 2 days (not 1) deliberately overlaps the previous day so a lead dated
  * right at a midnight boundary (or skewed by the UTC-vs-SAST 2hr offset)
- * never falls through a gap between cron ticks. A dealer's stored
- * startDate is no longer used for regular syncs — kept in config only for
- * reference / manual backfill purposes (no backfill mechanism currently
- * exists — flagged as an open gap, not solved here).
+ * never falls through a gap between cron ticks. This margin is more than
+ * sufficient at 5-min ticks — it was originally sized for a 30-min gap
+ * between dispatches, so there's no need to shrink it now that dispatch is
+ * more frequent. A dealer's stored startDate is no longer used for regular
+ * syncs — kept in config only for reference / manual backfill purposes (no
+ * backfill mechanism currently exists — flagged as an open gap, not solved
+ * here).
  *
  * ─────────────────────────────────────────────────────────────────────────
  * MESSAGE / CALL CONTRACTS
@@ -111,17 +130,17 @@
  *     this Worker awaits the response before marking the lead forwarded.
  *
  * REQUIRED wrangler.toml:
- *   [triggers] crons = ["every 30 minutes" cron expression, e.g. star-slash-30 star star star star]
+ *   [triggers] crons = ["every 5 minutes" cron expression, e.g. star-slash-5 star star star star]
  *   [[kv_namespaces]] binding = "LEADS_SYNC_CONFIG"
  *   [[kv_namespaces]] binding = "SERITI_TOKEN_CACHE"
- *   [[kv_namespaces]] binding = "LEADS_SYNC_CACHE"   ← NEW, for the lead-level dedup marker
+ *   [[kv_namespaces]] binding = "LEADS_SYNC_CACHE"   ← for the lead-level dedup marker
  *   [[queues.producers]] binding = "BRANCH_FETCH_QUEUE" queue = "branch-fetch-queue"
  *   [[queues.consumers]] queue = "branch-fetch-queue"
  *     max_batch_size = 1   ← CRITICAL. >1 reintroduces shared-budget sharing.
  *     max_retries = 3, dead_letter_queue = "branch-fetch-dlq"
  *   [[queues.consumers]] queue = "branch-fetch-dlq"
  *     max_batch_size = 10, max_retries = 3
- *   [[services]] binding = "QUEUE_WORKER" service = "queue-worker"   ← NEW
+ *   [[services]] binding = "QUEUE_WORKER" service = "queue-worker"
  *
  * CONFIRMED: Seriti auth tokens last 1 hour. SERITI_TOKEN_CACHE_TTL below
  * caches for 55 minutes, same margin used for VMG's own token cache
@@ -242,12 +261,14 @@ async function dispatch(env) {
 
   // Chunk into smaller batches than Queues' own 100-message max — sending
   // everything in one large sendBatch() call risks hitting a per-request
-  // burst/throughput limit even when the DAILY operations budget is fine
+  // burst/throughput limit even when the operations budget itself is fine
   // (confirmed in production: a single 30-message sendBatch() call got
   // "Too Many Requests" even after moving dispatch to a 30-min interval,
-  // which had already fixed the separate daily-budget problem). A smaller
+  // which had already fixed the separate budget problem). A smaller
   // chunk size, with a brief pause between chunks, spreads the same total
   // message count across multiple smaller bursts instead of one large one.
+  // With dispatch back on 5-min ticks, this burst ceiling gets hit up to
+  // 6x more often — watch logs for chunksFailed warnings after deploying.
   // Each chunk is still independently fault-tolerant — see file header
   // "QUEUE SEND RATE LIMITING" note.
   const CHUNK_SIZE = 10;
@@ -267,7 +288,7 @@ async function dispatch(env) {
       chunksFailed++;
       console.error(
         `❌ Chunk ${chunkNum}/${totalChunks} (${chunk.length} branch job(s)) failed to enqueue after all retries: ${err.message}. ` +
-        `These branches were NOT dispatched this cycle — they'll be attempted again automatically on the next dispatch (~30 min).`
+        `These branches were NOT dispatched this cycle — they'll be attempted again automatically on the next dispatch (~5 min).`
       );
     }
 
@@ -395,8 +416,8 @@ async function syncBranch(job, env) {
 // — that's still queue-worker's job) via a dedicated cron-worker marker,
 // so the same lead isn't re-forwarded on every tick for its whole 2-day
 // stay in the rolling window. Marker is only written on a SUCCESSFUL
-// forward — a failed call leaves it unmarked, so the next tick (up to 30
-// min later) naturally retries it. This is the retry mechanism now that
+// forward — a failed call leaves it unmarked, so the next tick (up to
+// 5 min later) naturally retries it. This is the retry mechanism now that
 // there's no queue providing one automatically.
 const CRON_FORWARD_MARKER_TTL = 259200; // 3 days — safely beyond the 2-day rolling window, so a forwarded lead is never reconsidered while it's still in-window.
 
@@ -439,7 +460,7 @@ async function forwardLeads(leads, intent, dealerKey, branchCode, destinations, 
       sentCount++;
     } catch (err) {
       console.error(`  ❌ Failed to forward lead ${lead.firstName} ${lead.lastName} to queue-worker: ${err.message}`);
-      // Don't mark the forward key — next dispatch cycle (up to 30 min
+      // Don't mark the forward key — next dispatch cycle (up to 5 min
       // later) will retry this same lead, since it's still unmarked and
       // still within the rolling fetch window.
     }
