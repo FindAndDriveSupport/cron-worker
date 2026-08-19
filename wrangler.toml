@@ -5,7 +5,7 @@ compatibility_flags = ["nodejs_compat"]
 tail_consumers = [{ service = "alert-worker" }]
 
 [triggers]
-crons = ["*/30 * * * *"]
+crons = ["*/5 * * * *"]
 
 [[kv_namespaces]]
 binding = "LEADS_SYNC_CONFIG"
