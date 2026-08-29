@@ -114,7 +114,7 @@
  * here).
  *
  * ─────────────────────────────────────────────────────────────────────────
- * DIRECT API INTEGRATION DEALERS — excluded from dispatch entirely
+ * DIRECT API INTEGRATION DEALERS — token refreshed, dispatch skipped
  * ─────────────────────────────────────────────────────────────────────────
  * A dealer with `directApiIntegration: true` in its LEADS_SYNC_CONFIG entry
  * pulls leads by calling the Seriti API directly (their own integration,
@@ -124,6 +124,13 @@
  * misconfiguration — so they're skipped in dispatch() BEFORE the
  * "no destinations/branches configured" check, with a plain console.log
  * (not console.error), so alert-worker never fires on them.
+ *
+ * They still need a warm SERITI_TOKEN_CACHE entry, though — their own
+ * integration relies on the same cached token this pipeline maintains
+ * rather than authenticating with Seriti itself. So dispatch() calls
+ * getSeritiToken() directly for these dealers (refreshing the cache when
+ * needed, same as syncBranch() would) before skipping the rest of the
+ * branch/lead dispatch work for them.
  *
  * ─────────────────────────────────────────────────────────────────────────
  * MESSAGE / CALL CONTRACTS
@@ -237,9 +244,15 @@ async function dispatch(env) {
     // pull leads by calling Seriti themselves, so they legitimately have
     // no destinations/branches configured. Excluded here, BEFORE the
     // getEffectiveBranches()/"no destinations" check below, so it never
-    // logs as an error or fires alert-worker.
+    // logs as an error or fires alert-worker. Their Seriti token is still
+    // refreshed, since their own integration relies on this cache.
     if (dealer.directApiIntegration) {
-      console.log(`ℹ️  Dealer ${dealer.key} uses direct Seriti API integration — excluded from dispatch.`);
+      try {
+        await getSeritiToken(dealer.key, dealer.seritiApiKey, dealer.seritiApiSecret, env);
+        console.log(`ℹ️  Dealer ${dealer.key} uses direct Seriti API integration — token refreshed, excluded from lead dispatch.`);
+      } catch (err) {
+        console.error(`❌ Failed to refresh Seriti token for direct-integration dealer ${dealer.key}: ${err.message}`);
+      }
       continue;
     }
 
