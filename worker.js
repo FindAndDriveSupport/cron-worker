@@ -114,6 +114,18 @@
  * here).
  *
  * ─────────────────────────────────────────────────────────────────────────
+ * DIRECT API INTEGRATION DEALERS — excluded from dispatch entirely
+ * ─────────────────────────────────────────────────────────────────────────
+ * A dealer with `directApiIntegration: true` in its LEADS_SYNC_CONFIG entry
+ * pulls leads by calling the Seriti API directly (their own integration,
+ * outside this pipeline) rather than receiving them via push destinations
+ * (email/CRM/DealerOS/etc). These dealers legitimately have zero
+ * destinations/branches configured — that's by design, not a
+ * misconfiguration — so they're skipped in dispatch() BEFORE the
+ * "no destinations/branches configured" check, with a plain console.log
+ * (not console.error), so alert-worker never fires on them.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
  * MESSAGE / CALL CONTRACTS
  * ─────────────────────────────────────────────────────────────────────────
  * Produced onto branch-fetch-queue (internal, consumed by this same Worker):
@@ -218,6 +230,16 @@ async function dispatch(env) {
       dealer = JSON.parse(raw);
     } catch {
       console.error(`❌ Invalid JSON for dealer config: ${name}`);
+      continue;
+    }
+
+    // See file header "DIRECT API INTEGRATION DEALERS" — these dealers
+    // pull leads by calling Seriti themselves, so they legitimately have
+    // no destinations/branches configured. Excluded here, BEFORE the
+    // getEffectiveBranches()/"no destinations" check below, so it never
+    // logs as an error or fires alert-worker.
+    if (dealer.directApiIntegration) {
+      console.log(`ℹ️  Dealer ${dealer.key} uses direct Seriti API integration — excluded from dispatch.`);
       continue;
     }
 
