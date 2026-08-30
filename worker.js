@@ -70,6 +70,49 @@
  * automatically (the replacement for the queue's built-in per-message retry).
  *
  * ─────────────────────────────────────────────────────────────────────────
+ * POLICY NUMBER BACKFILL (added 2026-08-29)
+ * ─────────────────────────────────────────────────────────────────────────
+ * A lead can be synced to its CRMs well before the customer finishes the
+ * finance application in the widget (Step 3 → Edith CreatePolicy), since
+ * the two flows are entirely decoupled — this Worker polls Seriti on its
+ * own 5-min cadence, independent of anything happening in the widget.
+ *
+ * Once a lead has already been forwarded (CRON_FORWARD_MARKER_TTL marker
+ * set), forwardLeads() no longer skips it outright. Instead it checks a
+ * SEPARATE marker (POLICY_FWD_MARKER_TTL) — if a policy number hasn't been
+ * pushed for this lead yet, it looks up policy_events in D1 (joined on
+ * applicantId — Seriti issues the same value on both the lead feed and the
+ * widget's Step 3 submission, so this is a direct match, not a fuzzy one;
+ * mobileNumber is only a fallback for a missing applicantId) and, if a
+ * policy number now exists, sends a lightweight `policyOnlyUpdate` call to queue-worker
+ * instead of a normal lead-forward. This does NOT touch or reset the
+ * original CRON_FORWARD_MARKER_TTL marker or queue-worker's own
+ * per-destination cacheKey dedup — it's an entirely separate, one-shot
+ * marker so the policy number is pushed exactly once, whenever it first
+ * appears, and never rechecked again afterward.
+ *
+ * The same D1 lookup also runs on a lead's FIRST forward, in case the
+ * customer already finished their application before the lead was ever
+ * synced (rare, but cheap to check) — in that case the policy number
+ * rides along on the normal forward and POLICY_FWD_MARKER_TTL is set
+ * immediately, skipping the backfill path entirely for that lead.
+ *
+ * FUTURE POLICIES ONLY — POLICY_BACKFILL_CUTOFF: this feature must never
+ * reach into policy_events history and start pushing ALREADY-COMPLETED
+ * applications to CRMs the moment it deploys. findPolicyNumber() only
+ * matches rows with `created_at >= POLICY_BACKFILL_CUTOFF` — policy_events
+ * already has a genuine created_at TEXT column (DEFAULT datetime('now'),
+ * format 'YYYY-MM-DD HH:MM:SS', confirmed against real rows), so this is a
+ * plain date filter, no migration required. SET THIS BEFORE DEPLOYING:
+ * set the constant below to midnight UTC of the day you deploy (or any
+ * later date) — everything with an earlier created_at is permanently
+ * invisible to this lookup.
+ *
+ * This does not run for directApiIntegration dealers (see next section) —
+ * they never reach forwardLeads() at all, since dispatch() skips them
+ * before any branch/lead work happens.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
  * QUEUE SEND RATE LIMITING (dispatch → BRANCH_FETCH_QUEUE.sendBatch)
  * ─────────────────────────────────────────────────────────────────────────
  * This exact failure took leads-api down for most of a day: sendBatch()
@@ -147,6 +190,14 @@
  *   { dealerKey, branchCode, intent, lead, approvalChance, destinations }
  *   — ONE call per lead, not per lead-destination pair. Synchronous —
  *     this Worker awaits the response before marking the lead forwarded.
+ *   — lead.policyNumber is included when a policy number was found on a
+ *     lead's FIRST forward (see "POLICY NUMBER BACKFILL" above).
+ *
+ * POST to queue-worker for a policy-number-only backfill (same endpoint,
+ * different shape — see "POLICY NUMBER BACKFILL" above):
+ *   { dealerKey, branchCode, intent, lead, destinations, policyOnlyUpdate: true }
+ *   — lead here only needs idNumber/mobileNumber/date (for cacheKey
+ *     reconstruction) plus policyNumber. approvalChance is not needed.
  *
  * REQUIRED wrangler.toml:
  *   [triggers] crons = ["every 5 minutes" cron expression, e.g. star-slash-5 star star star star]
@@ -160,6 +211,10 @@
  *   [[queues.consumers]] queue = "branch-fetch-dlq"
  *     max_batch_size = 10, max_retries = 3
  *   [[services]] binding = "QUEUE_WORKER" service = "queue-worker"
+ *   [[d1_databases]] binding = "DB"   ← SAME D1 database the E-fficient
+ *     widget's createPolicy.js writes policy_events to (same Cloudflare
+ *     account — use its database_id from that worker's wrangler.toml).
+ *     Read-only usage here (SELECT against policy_events only).
  *
  * CONFIRMED: Seriti auth tokens last 1 hour. SERITI_TOKEN_CACHE_TTL below
  * caches for 55 minutes, same margin used for VMG's own token cache
@@ -172,6 +227,13 @@ const SHARED_CREDENTIALS_KEY = "__shared_credentials__";
 const SERITI_TOKEN_CACHE_TTL = 3300; // 55 min — Seriti tokens confirmed to last 1 hour.
 const LOOKBACK_DAYS = 2;             // see file header "ROLLING DATE WINDOW".
 const MAX_BRANCH_SYNC_RETRIES = 3;   // keep in sync with branch-fetch-queue's max_retries in wrangler.toml.
+
+// ⚠️  SET THIS BEFORE DEPLOYING — see file header "FUTURE POLICIES ONLY".
+// Format must match policy_events.created_at exactly: 'YYYY-MM-DD HH:MM:SS'
+// (UTC, confirmed against real rows). Set to midnight UTC of the day you
+// deploy, or any later date — anything with an earlier created_at is
+// permanently excluded from this lookup.
+const POLICY_BACKFILL_CUTOFF = "2026-08-31 00:00:00"; // ← adjust to your actual deploy date if different.
 
 function getRollingDateRange() {
   const endDate = new Date().toISOString().slice(0, 10);
@@ -454,7 +516,13 @@ async function syncBranch(job, env) {
 // forward — a failed call leaves it unmarked, so the next tick (up to
 // 5 min later) naturally retries it. This is the retry mechanism now that
 // there's no queue providing one automatically.
-const CRON_FORWARD_MARKER_TTL = 259200; // 3 days — safely beyond the 2-day rolling window, so a forwarded lead is never reconsidered while it's still in-window.
+//
+// Once a lead HAS been forwarded, this function no longer skips it
+// outright — it checks (via a separate, one-shot marker) whether a policy
+// number has since appeared in D1 and, if so, backfills it to the CRMs
+// exactly once. See file header "POLICY NUMBER BACKFILL".
+const CRON_FORWARD_MARKER_TTL = 259200;  // 3 days — safely beyond the 2-day rolling window, so a forwarded lead is never reconsidered while it's still in-window.
+const POLICY_FWD_MARKER_TTL = 259200;    // same window — no need to keep checking once the rolling window has moved past this lead anyway.
 
 async function forwardLeads(leads, intent, dealerKey, branchCode, destinations, env, kredoOpts) {
   let sentCount = 0;
@@ -462,11 +530,52 @@ async function forwardLeads(leads, intent, dealerKey, branchCode, destinations, 
   for (const lead of leads) {
     const uniqueId = lead.idNumber || lead.mobileNumber || "unknown";
     const forwardKey = `fwd-${dealerKey}-${branchCode || "default"}-${intent}-${uniqueId}-${lead.date}`;
+    const policyFwdKey = `policy-fwd-${dealerKey}-${branchCode || "default"}-${intent}-${uniqueId}-${lead.date}`;
 
     const alreadyForwarded = await env.LEADS_SYNC_CACHE.get(forwardKey);
-    if (alreadyForwarded) continue;
+
+    if (alreadyForwarded) {
+      // Lead already synced to its CRMs on an earlier tick — the only
+      // thing left to check is whether the customer has since finished
+      // their application. Once pushed, POLICY_FWD_MARKER_TTL stops this
+      // from being rechecked every 5 min forever.
+      const alreadyPushedPolicy = await env.LEADS_SYNC_CACHE.get(policyFwdKey);
+      if (alreadyPushedPolicy) continue;
+
+      const policyNumber = await findPolicyNumber(lead.applicantId, lead.mobileNumber, env);
+      if (!policyNumber) continue; // not completed yet — check again next tick.
+
+      try {
+        const res = await env.QUEUE_WORKER.fetch("https://internal/process-lead", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            dealerKey, branchCode, intent,
+            lead: { ...lead, policyNumber },
+            destinations,
+            policyOnlyUpdate: true,
+          }),
+        });
+        if (!res.ok) throw new Error(`queue-worker responded ${res.status}`);
+
+        await env.LEADS_SYNC_CACHE.put(policyFwdKey, "1", { expirationTtl: POLICY_FWD_MARKER_TTL });
+        console.log(`  ✅ Policy number ${policyNumber} backfilled for ${lead.firstName} ${lead.lastName}.`);
+      } catch (err) {
+        console.error(`  ❌ Failed to backfill policy number for ${lead.firstName} ${lead.lastName}: ${err.message}`);
+        // Leave policyFwdKey unset — same retry pattern as forwardKey below:
+        // next tick (up to 5 min later) tries again automatically.
+      }
+      continue;
+    }
 
     let approvalChance = lead.approvalChance ?? null;
+
+    // Cheap to check even on a first forward — covers the rare case where
+    // the customer completed their application before this lead was ever
+    // synced. If found, it rides along on the normal forward below and
+    // POLICY_FWD_MARKER_TTL is set immediately, so the backfill branch
+    // above never has to look at this lead again.
+    const policyNumber = await findPolicyNumber(lead.applicantId, lead.mobileNumber, env);
 
     if (kredoOpts.runKredo) {
       try {
@@ -484,7 +593,12 @@ async function forwardLeads(leads, intent, dealerKey, branchCode, destinations, 
       const res = await env.QUEUE_WORKER.fetch("https://internal/process-lead", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ dealerKey, branchCode, intent, lead, approvalChance, destinations }),
+        body: JSON.stringify({
+          dealerKey, branchCode, intent,
+          lead: policyNumber ? { ...lead, policyNumber } : lead,
+          approvalChance,
+          destinations,
+        }),
       });
 
       if (!res.ok) {
@@ -492,6 +606,9 @@ async function forwardLeads(leads, intent, dealerKey, branchCode, destinations, 
       }
 
       await env.LEADS_SYNC_CACHE.put(forwardKey, "1", { expirationTtl: CRON_FORWARD_MARKER_TTL });
+      if (policyNumber) {
+        await env.LEADS_SYNC_CACHE.put(policyFwdKey, "1", { expirationTtl: POLICY_FWD_MARKER_TTL });
+      }
       sentCount++;
     } catch (err) {
       console.error(`  ❌ Failed to forward lead ${lead.firstName} ${lead.lastName} to queue-worker: ${err.message}`);
@@ -502,6 +619,43 @@ async function forwardLeads(leads, intent, dealerKey, branchCode, destinations, 
   }
 
   return sentCount;
+}
+
+// ─── Policy number lookup (D1) ─────────────────────────────────────────────
+// Matches a Seriti lead against a completed Edith policy via the shared
+// applicantId — Seriti issues this same value on both sides (the lead
+// feed cron-worker pulls, and body.applicantId in the widget's Step 3
+// submission that createPolicy.js writes to policy_events.applicant_id),
+// so it's a direct, reliable join — no idNumber/mobileNumber fuzzy
+// matching needed. mobileNumber is kept as a fallback only for the rare
+// case a lead's applicantId is missing/empty. Read-only against
+// policy_events; failures here should never block the normal lead-forward
+// path, so they're caught and logged rather than thrown.
+//
+// `created_at >= POLICY_BACKFILL_CUTOFF` is what keeps this feature
+// future-only — see file header "FUTURE POLICIES ONLY". Applies to BOTH
+// call sites in forwardLeads() (first-forward and the ongoing backfill
+// check), since both go through this one function.
+async function findPolicyNumber(applicantId, mobileNumber, env) {
+  if (!env.DB) return null;
+  if (!applicantId && !mobileNumber) return null;
+
+  try {
+    const row = await env.DB.prepare(`
+      SELECT policy_number FROM policy_events
+      WHERE policy_number IS NOT NULL
+        AND status = 'success'
+        AND created_at >= ?1
+        AND (applicant_id = ?2 OR applicant_mobile = ?3)
+      ORDER BY id DESC
+      LIMIT 1
+    `).bind(POLICY_BACKFILL_CUTOFF, applicantId || null, mobileNumber || null).first();
+
+    return row?.policy_number || null;
+  } catch (err) {
+    console.error(`  ⚠️  Policy number lookup failed (applicantId=${applicantId ? '✓' : '—'}, mobile=${mobileNumber ? '✓' : '—'}): ${err.message}`);
+    return null;
+  }
 }
 
 // ─── Seriti auth (KV-cached, per-dealer) ────────────────────────────────────
