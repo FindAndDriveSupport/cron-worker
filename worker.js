@@ -70,6 +70,40 @@
  * automatically (the replacement for the queue's built-in per-message retry).
  *
  * ─────────────────────────────────────────────────────────────────────────
+ * DEDUP BUGFIX (2026-09-04): "successful forward" now means ALL
+ * destinations actually delivered, not just "queue-worker returned 200"
+ * ─────────────────────────────────────────────────────────────────────────
+ * PRIOR BUG: this Worker marked a lead's forward key "done" (3-day TTL —
+ * see CRON_FORWARD_MARKER_TTL below) as soon as queue-worker's
+ * /process-lead call returned ANY 2xx response. But queue-worker's own
+ * handler always returns 200 as long as it doesn't crash outright —
+ * per-destination delivery failures inside it were caught, logged, and
+ * swallowed, not thrown (see queue-worker's file header). That meant a
+ * lead whose DealerOS delivery failed — e.g. during the multi-day DealerOS
+ * 503 outage from 2026-08-22 to 2026-09-04 — still got marked "fully
+ * forwarded" here. Once marked, the 3-day TTL deliberately outlives the
+ * 2-day Seriti rolling lookback window (see "ROLLING DATE WINDOW" below),
+ * specifically so a genuinely-delivered lead is never reconsidered. That
+ * same design meant a FAILED delivery marked this way could ALSO never be
+ * reconsidered — it was silently and permanently lost from DealerOS's
+ * perspective. Real customer leads were affected, not just test leads.
+ *
+ * FIX: queue-worker's /process-lead response now includes a routedResults
+ * array covering every destination (not just newly-attempted ones), each
+ * tagged with a status: "success", "failed", "skipped-done", or
+ * "skipped-inflight" (see queue-worker's file header for full detail on
+ * each). forwardLeads() below now only writes the forward-key marker when
+ * EVERY destination's status is "success" or "skipped-done" — i.e. truly,
+ * confirmedly delivered, either this call or a prior one. If any
+ * destination is "failed" or "skipped-inflight", the marker is left unset
+ * and this lead is retried on the very next dispatch tick (up to 5 min
+ * later), same as any other forward failure — no reliance on the 1-hour
+ * "queued" TTL expiring first. This check applies ONLY to the normal
+ * first-forward path below — the policy-number backfill path (see next
+ * section) is a separate, independently-governed one-shot update and is
+ * unaffected by this fix.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
  * POLICY NUMBER BACKFILL (added 2026-08-29)
  * ─────────────────────────────────────────────────────────────────────────
  * A lead can be synced to its CRMs well before the customer finishes the
@@ -95,7 +129,10 @@
  * customer already finished their application before the lead was ever
  * synced (rare, but cheap to check) — in that case the policy number
  * rides along on the normal forward and POLICY_FWD_MARKER_TTL is set
- * immediately, skipping the backfill path entirely for that lead.
+ * immediately (but ONLY if that forward is confirmed fully delivered per
+ * the DEDUP BUGFIX above — a policy number is never attached to a lead
+ * that wasn't actually confirmed delivered), skipping the backfill path
+ * entirely for that lead.
  *
  * FUTURE POLICIES ONLY — POLICY_BACKFILL_CUTOFF: this feature must never
  * reach into policy_events history and start pushing ALREADY-COMPLETED
@@ -189,7 +226,9 @@
  * NOT a queue message — see "QUEUES OPERATIONS BUDGET" above:
  *   { dealerKey, branchCode, intent, lead, approvalChance, destinations }
  *   — ONE call per lead, not per lead-destination pair. Synchronous —
- *     this Worker awaits the response before marking the lead forwarded.
+ *     this Worker awaits the response and now inspects routedResults
+ *     before deciding whether to mark the lead forwarded (see "DEDUP
+ *     BUGFIX" above — it no longer trusts res.ok alone).
  *   — lead.policyNumber is included when a policy number was found on a
  *     lead's FIRST forward (see "POLICY NUMBER BACKFILL" above).
  *
@@ -512,10 +551,11 @@ async function syncBranch(job, env) {
 // destinations array. Deduplicated at the LEAD level (not per-destination
 // — that's still queue-worker's job) via a dedicated cron-worker marker,
 // so the same lead isn't re-forwarded on every tick for its whole 2-day
-// stay in the rolling window. Marker is only written on a SUCCESSFUL
-// forward — a failed call leaves it unmarked, so the next tick (up to
-// 5 min later) naturally retries it. This is the retry mechanism now that
-// there's no queue providing one automatically.
+// stay in the rolling window. Marker is only written once EVERY
+// destination is confirmed truly delivered (see file header "DEDUP
+// BUGFIX") — a failed or still-ambiguous call leaves it unmarked, so the
+// next tick (up to 5 min later) naturally retries it. This is the retry
+// mechanism now that there's no queue providing one automatically.
 //
 // Once a lead HAS been forwarded, this function no longer skips it
 // outright — it checks (via a separate, one-shot marker) whether a policy
@@ -573,7 +613,8 @@ async function forwardLeads(leads, intent, dealerKey, branchCode, destinations, 
     // Cheap to check even on a first forward — covers the rare case where
     // the customer completed their application before this lead was ever
     // synced. If found, it rides along on the normal forward below and
-    // POLICY_FWD_MARKER_TTL is set immediately, so the backfill branch
+    // POLICY_FWD_MARKER_TTL is set immediately (but only once that forward
+    // is confirmed fully delivered — see below), so the backfill branch
     // above never has to look at this lead again.
     const policyNumber = await findPolicyNumber(lead.applicantId, lead.mobileNumber, env);
 
@@ -603,6 +644,28 @@ async function forwardLeads(leads, intent, dealerKey, branchCode, destinations, 
 
       if (!res.ok) {
         throw new Error(`queue-worker responded ${res.status}`);
+      }
+
+      const { routedResults } = await res.json().catch(() => ({ routedResults: [] }));
+
+      // See file header "DEDUP BUGFIX" — only "success" (delivered this
+      // call) or "skipped-done" (a prior call already delivered it) count
+      // as truly done. "failed" and "skipped-inflight" mean at least one
+      // destination did NOT actually receive this lead yet.
+      const allDestinationsDone = (routedResults || []).every(
+        (r) => r.status === "success" || r.status === "skipped-done"
+      );
+
+      if (!allDestinationsDone) {
+        const notDone = (routedResults || []).filter(
+          (r) => r.status !== "success" && r.status !== "skipped-done"
+        );
+        console.error(
+          `  ⚠️  Lead ${lead.firstName} ${lead.lastName} NOT fully delivered — ` +
+          `${notDone.map(r => `${r.type}:${r.status}`).join(", ")}. ` +
+          `Leaving forward marker unset so this lead retries next tick.`
+        );
+        continue; // Don't mark forwarded, don't set policyFwdKey, don't increment sentCount — retry next tick.
       }
 
       await env.LEADS_SYNC_CACHE.put(forwardKey, "1", { expirationTtl: CRON_FORWARD_MARKER_TTL });
